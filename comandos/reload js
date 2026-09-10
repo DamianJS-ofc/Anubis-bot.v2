@@ -1,0 +1,84 @@
+import fs from 'fs'
+import path from 'path'
+import { pathToFileURL } from 'url'
+import { fileURLToPath } from 'url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const ROOT = path.join(__dirname, '../')
+
+export const handler = {}
+handler.name = 'reload'
+handler.alias = ['recargar','re']
+handler.category = 'owner'
+handler.description = 'Recarga plugins y detecta errores (fix LID)'
+
+function getNum(jid){ return String(jid||'').replace(/[^0-9]/g,'') }
+
+async function lidToPn(sock, jidRaw){
+  if(!jidRaw) return ''
+  const s = String(jidRaw)
+  if(!s.includes('@lid') &&!/^\d{14,}$/.test(s.split('@')[0])) return s.split('@')[0].replace(/[^0-9]/g,'')
+  try{
+    if(sock.signalRepository?.lidMapping){
+      const pn = await sock.signalRepository.lidMapping.getPNForLID(s.includes('@')? s : `${s}@lid`)
+      if(pn) return pn.split('@')[0].replace(/[^0-9]/g,'')
+    }
+  }catch{}
+  return s.replace(/[^0-9]/g,'')
+}
+
+async function isOwner(sock, m, settings){
+  const raw = m.key.participant || m.key.remoteJid || ''
+  const realNum = await lidToPn(sock, raw)
+  const owners = settings?.owner || global.owner || []
+  if(!owners.length) return true
+  return owners.some(o=>{
+    const oc = String(o).replace(/[^0-9]/g,'')
+    return realNum.includes(oc) || oc.includes(realNum)
+  }) || m.key.fromMe
+}
+
+handler.exec = async (sock, m, extra) => {
+  const jid = m.key.remoteJid
+  const settings = extra?.settings || {}
+  if(!(await isOwner(sock, m, settings))){
+    return sock.sendMessage(jid, { text: '❌ Solo owner.' }, { quoted: m })
+  }
+  try{
+    const base = path.join(ROOT, 'comandos')
+    const getAll = (dir)=>{
+      let r=[]; for(const f of fs.readdirSync(dir)){
+        const full=path.join(dir,f); const st=fs.statSync(full)
+        if(st.isDirectory()) r=r.concat(getAll(full))
+        else if(f.endsWith('.js')) r.push(full)
+      } return r
+    }
+    const files = getAll(base)
+    let ok=0,fail=0,skip=0, fails=[]
+    for(const full of files){
+      const rel = path.relative(base, full)
+      let content=''; try{content=fs.readFileSync(full,'utf8')}catch(e){fail++; fails.push(`${rel} -> ${e.message}`); continue}
+      const isCmd = /handler\.name/.test(content) || /name\s*:\s*['"`]/.test(content)
+      if(!isCmd){ skip++; continue }
+      try{
+        const url = pathToFileURL(full).href + '?t=' + Date.now()
+        const mod = await import(url)
+        const p = mod.handler || mod.default
+        if(!p?.name &&!mod.handler?.name) throw new Error('sin name')
+        ok++
+      }catch(e){
+        fail++; fails.push(`💥 ${rel}\n${e.message.slice(0,200)}`)
+      }
+    }
+    let txt = `*🔄 RELOAD*\n✔️ ${ok} | ❌ ${fail} | ⏭️ ${skip}\nTotal: ${files.length}\n`
+    if(fails.length) txt += `\n*Errores:*\n` + fails.join('\n\n')
+    else txt += `\n✅ Todo OK`
+    await sock.sendMessage(jid, { text: txt.slice(0,4000) }, { quoted: m })
+    try{
+      const { loadPlugins } = await import(`file://${path.join(ROOT,'anubis-nucleo/handler.js')}?update=${Date.now()}`)
+      await loadPlugins()
+    }catch{}
+  }catch(e){
+    await sock.sendMessage(jid, { text: `❌ ${e.message}` }, { quoted: m })
+  }
+}
